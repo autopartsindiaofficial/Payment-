@@ -1,0 +1,6 @@
+{
+  "name": "ChatMate Payment Backend",
+  "description": "Node.js + Express backend server for ChatMate Razorpay payments and persistent premium subscription storage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
