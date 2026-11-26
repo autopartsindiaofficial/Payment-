@@ -7,7 +7,7 @@ import {
   activatePremiumFromVerification,
   activatePremiumFromWebhook,
   closeDb,
-  getDb,
+  DatabaseConfigError,
   getOrderById,
   getPremiumStatus,
   saveCreatedOrder,
@@ -61,6 +61,15 @@ interface RazorpayWebhookPayload {
 
 const PORT = Number(process.env.PORT) || 3000;
 
+function handleDatabaseError(res: Response, error: unknown, context: string): void {
+  if (error instanceof DatabaseConfigError) {
+    res.status(500).json({ error: 'Database is not configured on the server' });
+    return;
+  }
+  console.error(`${context}:`, error);
+  res.status(500).json({ error: 'Database operation failed' });
+}
+
 export function createApp() {
   const app = express();
 
@@ -83,7 +92,7 @@ export function createApp() {
   app.post(
     '/webhook',
     express.raw({ type: 'application/json', limit: '1mb' }),
-    (req: Request, res: Response) => {
+    async (req: Request, res: Response) => {
       const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET?.trim();
       if (!webhookSecret) {
         console.error('RAZORPAY_WEBHOOK_SECRET is not configured');
@@ -147,67 +156,71 @@ export function createApp() {
       let userId = validateUserId(rawUserId);
       let planId = isNonEmptyString(rawPlanId, 64) ? rawPlanId.trim() : null;
 
-      // Fallback to stored order record if notes were omitted in a partial webhook payload
-      if ((!userId || !planId) && orderId) {
-        const storedOrder = getOrderById(orderId);
-        if (storedOrder) {
-          userId = userId ?? storedOrder.user_id;
-          planId = planId ?? storedOrder.plan_id;
+      try {
+        // Fallback to stored order record if notes were omitted in a partial webhook payload
+        if ((!userId || !planId) && orderId) {
+          const storedOrder = await getOrderById(orderId);
+          if (storedOrder) {
+            userId = userId ?? storedOrder.user_id;
+            planId = planId ?? storedOrder.plan_id;
+          }
         }
+
+        if (!userId || !planId) {
+          res.status(400).json({ error: 'Missing valid userId or planId in webhook payload notes' });
+          return;
+        }
+
+        const plan = getPlanById(planId);
+        if (!plan) {
+          res.status(400).json({ error: 'Unsupported planId in webhook payload' });
+          return;
+        }
+
+        // Verify paid amount and currency when present in Razorpay webhook payload
+        const paidAmount = paymentEntity?.amount ?? orderEntity?.amount;
+        const paidCurrency = paymentEntity?.currency ?? orderEntity?.currency;
+        if (typeof paidAmount === 'number' && paidAmount < plan.amountPaise) {
+          res.status(400).json({ error: 'Captured amount is less than plan price' });
+          return;
+        }
+        if (typeof paidCurrency === 'string' && paidCurrency.toUpperCase() !== plan.currency) {
+          res.status(400).json({ error: 'Currency mismatch in webhook payload' });
+          return;
+        }
+
+        const headerEventId = req.header('x-razorpay-event-id');
+        const eventKey = isNonEmptyString(headerEventId, 128)
+          ? `hdr:${headerEventId.trim()}`
+          : `evt:${eventType}:${paymentId ?? ''}:${orderId ?? ''}`;
+
+        const result = await activatePremiumFromWebhook({
+          eventKey,
+          eventType,
+          userId,
+          planId: plan.id,
+          durationDays: plan.durationDays,
+          paymentId,
+          orderId,
+        });
+
+        if (result.status === 'conflict') {
+          res.status(409).json({ error: result.message ?? 'Payment conflict' });
+          return;
+        }
+
+        res.status(200).json({
+          received: true,
+          event: eventType,
+          idempotent: result.status === 'already_processed',
+          userId,
+          isPremium: result.isPremium,
+          planId: result.planId,
+          expiresAt: result.expiresAt,
+        });
+      } catch (error) {
+        handleDatabaseError(res, error, 'Webhook database error');
       }
-
-      if (!userId || !planId) {
-        res.status(400).json({ error: 'Missing valid userId or planId in webhook payload notes' });
-        return;
-      }
-
-      const plan = getPlanById(planId);
-      if (!plan) {
-        res.status(400).json({ error: 'Unsupported planId in webhook payload' });
-        return;
-      }
-
-      // Verify paid amount and currency when present in Razorpay webhook payload
-      const paidAmount = paymentEntity?.amount ?? orderEntity?.amount;
-      const paidCurrency = paymentEntity?.currency ?? orderEntity?.currency;
-      if (typeof paidAmount === 'number' && paidAmount < plan.amountPaise) {
-        res.status(400).json({ error: 'Captured amount is less than plan price' });
-        return;
-      }
-      if (typeof paidCurrency === 'string' && paidCurrency.toUpperCase() !== plan.currency) {
-        res.status(400).json({ error: 'Currency mismatch in webhook payload' });
-        return;
-      }
-
-      const headerEventId = req.header('x-razorpay-event-id');
-      const eventKey = isNonEmptyString(headerEventId, 128)
-        ? `hdr:${headerEventId.trim()}`
-        : `evt:${eventType}:${paymentId ?? ''}:${orderId ?? ''}`;
-
-      const result = activatePremiumFromWebhook({
-        eventKey,
-        eventType,
-        userId,
-        planId: plan.id,
-        durationDays: plan.durationDays,
-        paymentId,
-        orderId,
-      });
-
-      if (result.status === 'conflict') {
-        res.status(409).json({ error: result.message ?? 'Payment conflict' });
-        return;
-      }
-
-      res.status(200).json({
-        received: true,
-        event: eventType,
-        idempotent: result.status === 'already_processed',
-        userId,
-        isPremium: result.isPremium,
-        planId: result.planId,
-        expiresAt: result.expiresAt,
-      });
     }
   );
 
@@ -278,7 +291,7 @@ export function createApp() {
       }
 
       const order = (await razorpayRes.json()) as RazorpayOrderResponse;
-      saveCreatedOrder({
+      await saveCreatedOrder({
         orderId: order.id,
         userId,
         planId: plan.id,
@@ -293,13 +306,17 @@ export function createApp() {
         keyId,
       });
     } catch (error) {
+      if (error instanceof DatabaseConfigError) {
+        handleDatabaseError(res, error, 'Order persistence error');
+        return;
+      }
       console.error('Razorpay order creation request failed:', error);
       res.status(502).json({ error: 'Unable to reach Razorpay Orders API' });
     }
   });
 
   // 3. POST /verify-payment -> verify HMAC-SHA256 signature, save premium (+365 days), return { verified: true, isPremium: true, expiresAt }
-  app.post('/verify-payment', (req: Request, res: Response) => {
+  app.post('/verify-payment', async (req: Request, res: Response) => {
     const keySecret = process.env.RAZORPAY_KEY_SECRET?.trim();
     if (!keySecret) {
       console.error('RAZORPAY_KEY_SECRET is not configured');
@@ -355,40 +372,48 @@ export function createApp() {
       return;
     }
 
-    const result = activatePremiumFromVerification({
-      userId,
-      planId: plan.id,
-      durationDays: plan.durationDays,
-      paymentId,
-      orderId,
-    });
+    try {
+      const result = await activatePremiumFromVerification({
+        userId,
+        planId: plan.id,
+        durationDays: plan.durationDays,
+        paymentId,
+        orderId,
+      });
 
-    if (result.status === 'conflict') {
-      res.status(409).json({ verified: false, error: result.message ?? 'Payment verification conflict' });
-      return;
+      if (result.status === 'conflict') {
+        res.status(409).json({ verified: false, error: result.message ?? 'Payment verification conflict' });
+        return;
+      }
+
+      res.status(200).json({
+        verified: true,
+        isPremium: true,
+        expiresAt: result.expiresAt,
+      });
+    } catch (error) {
+      handleDatabaseError(res, error, 'Verify payment database error');
     }
-
-    res.status(200).json({
-      verified: true,
-      isPremium: true,
-      expiresAt: result.expiresAt,
-    });
   });
 
   // 5. GET /premium-status -> accept ?userId=..., return { isPremium, planId, expiresAt }
-  app.get('/premium-status', (req: Request, res: Response) => {
+  app.get('/premium-status', async (req: Request, res: Response) => {
     const userId = validateUserId(req.query.userId);
     if (!userId) {
       res.status(400).json({ error: 'Invalid or missing userId query parameter' });
       return;
     }
 
-    const status = getPremiumStatus(userId);
-    res.status(200).json({
-      isPremium: status.isPremium,
-      planId: status.planId,
-      expiresAt: status.expiresAt,
-    });
+    try {
+      const status = await getPremiumStatus(userId);
+      res.status(200).json({
+        isPremium: status.isPremium,
+        planId: status.planId,
+        expiresAt: status.expiresAt,
+      });
+    } catch (error) {
+      handleDatabaseError(res, error, 'Get premium status database error');
+    }
   });
 
   // 404 fallback
@@ -409,9 +434,6 @@ export function createApp() {
   return app;
 }
 
-// Initialize SQLite database on startup
-getDb();
-
 const app = createApp();
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`ChatMate Payment Backend listening on http://0.0.0.0:${PORT}`);
@@ -420,8 +442,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 function shutdown(signal: string) {
   console.log(`Received ${signal}, shutting down gracefully...`);
   server.close(() => {
-    closeDb();
-    process.exit(0);
+    closeDb()
+      .catch((err) => console.error('Error closing database pool:', err))
+      .finally(() => process.exit(0));
   });
 }
 
